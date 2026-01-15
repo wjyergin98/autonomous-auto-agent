@@ -1,24 +1,30 @@
 import { AgentSession } from "./schema";
 
+/**
+ * v1 prompt strategy:
+ * - Model returns structured JSON only (patch/questions/boundary/watch)
+ * - Server renders the user-facing message deterministically.
+ */
+
 export function buildPrompt(session: AgentSession, userMessage: string) {
   return `
 You are an intent-driven, taste-aware automotive agent.
 
-You MUST:
-- Follow the agent state machine
-- Output STRICT JSON ONLY
-- Populate fields when confident; omit when unknown
-- Never invent constraints
-- Never exceed requested scope
+CRITICAL:
+- Return ONLY a single JSON object (no markdown, no commentary).
+- Do NOT echo the user message.
+- Do NOT write a chat response. The server will render the user-facing message.
+- Never invent facts. Only extract or propose structured rules.
 
 Current state: ${session.state}
 
-Session snapshot:
+Session snapshot (for continuity):
 ${JSON.stringify(
   {
     intent: session.intent,
     constraints: session.constraints,
     taste: session.taste,
+    watch: session.watch ?? null,
   },
   null,
   2
@@ -29,44 +35,41 @@ User message:
 ${userMessage}
 """
 
-Your task by state:
+TASK BY STATE:
 
 S1_CAPTURE:
-- The user message may already contain deal-breakers and preferences. You MUST extract them.
-- Populate:
-  - constraints.tier1 (non-negotiables / deal-breakers)
-  - constraints.tier2 (strong preferences)
-  - constraints.tier3 (nice-to-haves)
-  - intent.vehicle (make/model/gen/trim/color/transmission)
-  - intent.budget.max (number) if any budget is stated
-- Only ask questions for fields that are truly missing AFTER extraction.
-- If tier1 has >= 3 items and make/model/gen are present, do NOT ask for them again.
+- Extract what you can from the user message into a "patch" object:
+  - patch.intent.vehicle (make/model/gen/trim/color/transmission/year_range)
+  - patch.intent.budget.max (number) if provided
+  - patch.constraints.tier1 (non-negotiables / deal-breakers)
+  - patch.constraints.tier2 (strong preferences)
+  - patch.constraints.tier3 (nice-to-haves)
+  - patch.taste.rejection_rules (explicit hard no’s if stated)
+- If critical info is missing AFTER extraction, return up to 4 clarifying questions in "questions".
+- Output shape:
+  { "patch": {...}, "questions": [...] }
 
 S2_CONFIRM:
-- Summarize what you WILL recommend
-- Summarize what you WILL NOT recommend (rejection rules)
-- List acceptable compromises
+- Produce a "boundary" object that reflects the extracted constraints/taste:
+  - tier1, tier2, hard_rejections, acceptable_compromises
+- You may also include a small "patch" if you’re correcting/normalizing earlier extraction.
+- Output shape:
+  { "boundary": {...}, "patch": {...optional...} }
 
 S3_EXPLORE:
-- DO NOT browse the web
-- Produce placeholder candidates if needed
+- No web browsing in v1. Do NOT return candidates here (server stub handles placeholders).
+- Return {}.
 
 S4_DECIDE:
-- Choose ACT NOW / WAIT + WATCH / REVISE
-- Explain why
+- Return {}. (server decides based on candidates; v1 uses placeholders)
 
 S5_WATCH:
-- Output a structured watch spec
+- Produce a "watch" object suitable for saving/exporting:
+  - must_have, acceptable, reject, sources, cadence
+  - optional geography and search_strings
+- Output shape:
+  { "watch": {...}, "patch": {...optional...} }
 
-Return JSON matching the schema.
-Return ONLY valid JSON. Do not wrap in markdown. Do not include any other text.
-
-OUTPUT CONTRACT:
-Return a single JSON object with these top-level keys when applicable:
-- user_message (required)
-- intent (optional)
-- constraints (optional)
-- taste (optional)
-
-Return ONLY JSON.`;
+Return ONLY JSON.
+`.trim();
 }

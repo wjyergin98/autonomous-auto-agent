@@ -14,11 +14,10 @@ export async function POST(req: NextRequest) {
     last_user_message: userMessage,
   };
 
-  // Advance state FIRST (state machine remains authoritative)
-  const execState = nextExecState(working);
-  working.state = execState;
+  // 1) Advance state deterministically (authoritative)
+  working.state = nextExecState(working);
 
-  // Build prompt
+  // 2) Ask model for structured outputs ONLY
   const prompt = buildPrompt(working, userMessage);
 
   try {
@@ -38,47 +37,141 @@ export async function POST(req: NextRequest) {
     }
 
     const modelData = parsed.data;
-    const userFacing =
-      modelData.user_message ??
-      modelData.message ??
-      "Received a structured update, but no user-facing message was provided.";
-    const cleaned = preventEcho(userFacing, userMessage);
 
+    // 3) Merge patch into session (controlled, deterministic)
+    if (modelData.patch) {
+      working = mergePatch(working, modelData.patch);
+    }
 
-    // Merge model output into session (controlled)
-    working = {
-      ...working,
-      intent: {
-        ...working.intent,
-        ...modelData.intent,
-      },
-      constraints: {
-        tier1: modelData.constraints?.tier1 ?? working.constraints.tier1,
-        tier2: modelData.constraints?.tier2 ?? working.constraints.tier2,
-        tier3: modelData.constraints?.tier3 ?? working.constraints.tier3,
-      },
-      taste: {
-        ...working.taste,
-        rejection_rules:
-          modelData.taste?.rejection_rules ?? working.taste.rejection_rules,
-      },
-    };
-
-    // Enforce caps defensively
+    // 4) Enforce caps defensively (if any candidates already exist)
     working.finalists = clampFinalists(working.finalists ?? []);
     working.discovery = clampDiscovery(working.discovery ?? []);
 
-    const apiResponse: AgentApiResponse = {
-      userFacingMessage: cleaned,
-      session: working,
-    };
+    // 5) Deterministic user message rendering (no model-written chat)
+    const userFacingMessage = renderMessage(working, modelData);
 
-    return NextResponse.json(apiResponse);
+    // 6) For states not yet model-driven in v1, keep stub outputs
+    // (S3/S4/S5 can be handled by model later; currently S3/S4 are placeholders)
+    if (working.state === "S3_EXPLORE" || working.state === "S4_DECIDE" || working.state === "S5_WATCH") {
+      const stubbed = runStubStep(working, []);
+      // But preserve any watch produced by the model in S5
+      return NextResponse.json({
+        userFacingMessage: userFacingMessage || stubbed.userFacingMessage,
+        session: stubbed.session,
+      } satisfies AgentApiResponse);
+    }
+
+    return NextResponse.json({
+      userFacingMessage,
+      session: working,
+    } satisfies AgentApiResponse);
   } catch (err) {
     console.error("Model error, falling back:", err);
-
-    return NextResponse.json(runStubStep(working,[]));
+    return NextResponse.json(runStubStep(working, []));
   }
+}
+
+function mergePatch(session: AgentSession, patch: any): AgentSession {
+  const s = structuredClone(session) as AgentSession;
+
+  if (patch.intent) {
+    s.intent = {
+      ...s.intent,
+      ...patch.intent,
+      vehicle: {
+        ...(s.intent.vehicle ?? {}),
+        ...(patch.intent.vehicle ?? {}),
+      },
+      budget: {
+        ...(s.intent.budget ?? {}),
+        ...(patch.intent.budget ?? {}),
+      },
+    } as any;
+  }
+
+  if (patch.constraints) {
+    s.constraints = {
+      tier1: patch.constraints.tier1 ?? s.constraints.tier1,
+      tier2: patch.constraints.tier2 ?? s.constraints.tier2,
+      tier3: patch.constraints.tier3 ?? s.constraints.tier3,
+    };
+  }
+
+  if (patch.taste) {
+    s.taste = {
+      ...s.taste,
+      rejection_rules: patch.taste.rejection_rules ?? s.taste.rejection_rules,
+    } as any;
+  }
+
+  return s;
+}
+
+function renderMessage(session: AgentSession, modelData: any): string {
+  const state = session.state;
+
+  if (state === "S1_CAPTURE") {
+    const missing = computeMissingForS1(session);
+    if (missing.length === 0) {
+      return (
+        "S1 Capture\n\n" +
+        "I extracted your constraints and vehicle intent. If anything in the Artifacts panel is wrong, correct it in chat. " +
+        "Otherwise reply **confirm** to proceed to boundary confirmation (S2)."
+      );
+    }
+
+    const questions: string[] = Array.isArray(modelData?.questions) ? modelData.questions : [];
+    const q = questions.length ? questions : missing.map((m) => m.question).slice(0, 4);
+
+    return (
+      "S1 Capture\n\n" +
+      "I extracted what I could. To proceed, answer:\n" +
+      q.slice(0, 4).map((x, i) => `${i + 1}. ${x}`).join("\n")
+    );
+  }
+
+  if (state === "S2_CONFIRM") {
+    const b = modelData?.boundary;
+
+    const tier1 = (b?.tier1?.length ? b.tier1 : session.constraints.tier1) ?? [];
+    const tier2 = (b?.tier2?.length ? b.tier2 : session.constraints.tier2) ?? [];
+    const rejects = (b?.hard_rejections?.length ? b.hard_rejections : session.taste.rejection_rules) ?? [];
+    const compromises = b?.acceptable_compromises ?? [];
+
+    return (
+      "S2 Confirm\n\n" +
+      "**Boundary (what qualifies):**\n" +
+      `- Tier 1 (non-negotiable): ${tier1.length ? tier1.join("; ") : "(none captured yet)"}\n` +
+      `- Tier 2 (strong preferences): ${tier2.length ? tier2.join("; ") : "(none captured yet)"}\n\n` +
+      `**Hard rejections:** ${rejects.length ? rejects.join("; ") : "(none captured yet)"}\n\n` +
+      `**Acceptable compromises:** ${compromises.length ? compromises.join("; ") : "(none proposed)"}\n\n` +
+      "Reply **confirm** to proceed to Explore (S3), or edit any rule."
+    );
+  }
+
+  // For other states, we allow stub to handle messaging.
+  return "";
+}
+
+function computeMissingForS1(session: AgentSession): Array<{ key: string; question: string }> {
+  const missing: Array<{ key: string; question: string }> = [];
+
+  const tier1Count = session.constraints.tier1?.length ?? 0;
+  if (tier1Count < 3) {
+    missing.push({ key: "tier1", question: "List your Tier 1 deal-breakers (3–6 items)." });
+  }
+
+  const v = session.intent.vehicle ?? {};
+  if (!v.make || !v.model || !v.gen) {
+    missing.push({ key: "vehicle", question: "Confirm make/model/generation (e.g., Porsche Boxster 986.2)." });
+  }
+
+  const budgetMax = (session.intent as any)?.budget?.max;
+  if (!budgetMax) {
+    missing.push({ key: "budget", question: "What is your max budget (rough is fine)?" });
+  }
+
+  return missing;
 }
 
 function runStubStep(session: AgentSession, userImages: string[]): AgentApiResponse {
@@ -87,11 +180,10 @@ function runStubStep(session: AgentSession, userImages: string[]): AgentApiRespo
   const goalHint = s.goal_type;
 
   if (s.state === "S1_CAPTURE") {
-    // Minimal prompt: reflect what we have + ask for missing critical fields (max 4)
     const questions: string[] = [];
     if (s.constraints.tier1.length < 3) questions.push("List your Tier 1 deal-breakers (3–6 items).");
     if (!s.intent.vehicle?.make) questions.push("What is the make/model/generation?");
-    if (!s.intent.budget?.max) questions.push("What is your max budget (even rough)?");
+    if (!(s.intent as any)?.budget?.max) questions.push("What is your max budget (even rough)?");
     if (!s.intent.horizon) questions.push("Is this a short-term buy or long-term keep?");
 
     const msg =
@@ -103,7 +195,6 @@ function runStubStep(session: AgentSession, userImages: string[]): AgentApiRespo
   }
 
   if (s.state === "S2_CONFIRM") {
-    // Construct boundary statement using the current constraints/taste
     const tier1 = s.constraints.tier1.length ? s.constraints.tier1 : ["(add Tier 1 constraints)"];
     const tier2 = s.constraints.tier2.length ? s.constraints.tier2 : ["(add Tier 2 constraints)"];
     const rejects = s.taste.rejection_rules.length ? s.taste.rejection_rules : ["(add rejection rules)"];
@@ -120,7 +211,6 @@ function runStubStep(session: AgentSession, userImages: string[]): AgentApiRespo
   }
 
   if (s.state === "S3_EXPLORE") {
-    // Placeholder candidates (until you wire real search)
     const finalists = [
       makeCandidate({
         title: "Placeholder Candidate A (mechanically strong, spec-aligned)",
@@ -184,7 +274,6 @@ function runStubStep(session: AgentSession, userImages: string[]): AgentApiRespo
   }
 
   if (s.state === "S5_WATCH") {
-    // Create a structured watch artifact from the constraints
     const must = s.constraints.tier1.length ? s.constraints.tier1 : ["(define must-have constraints)"];
     const acceptable = s.constraints.tier2.length ? s.constraints.tier2 : ["(define strong preferences)"];
     const reject = s.taste.rejection_rules.length ? s.taste.rejection_rules : ["(define rejections)"];
@@ -195,26 +284,20 @@ function runStubStep(session: AgentSession, userImages: string[]): AgentApiRespo
       reject,
       sources: ["Bring a Trailer", "Cars & Bids", "AutoTempest", "Enthusiast forums/classifieds"],
       cadence: "twice_weekly",
-      budget: s.intent.budget?.max ? { max: s.intent.budget.max, notes: s.intent.budget.notes } : undefined,
+      budget: (s.intent as any)?.budget?.max ? { max: (s.intent as any).budget.max, notes: (s.intent as any).budget.notes } : undefined,
       search_strings: {
         "Bring a Trailer": ["(query placeholder)"],
         "Cars & Bids": ["(query placeholder)"],
         AutoTempest: ["(query placeholder)"],
       },
-    };
+    } as any;
 
     const msg =
-      `S5 Watch\n\nCreated a watch spec with:\n` +
-      `- Must-have: ${s.watch.must_have.join("; ")}\n` +
-      `- Acceptable: ${s.watch.acceptable.join("; ")}\n` +
-      `- Reject: ${s.watch.reject.join("; ")}\n` +
-      `- Cadence: ${s.watch.cadence}\n\n` +
-      `You can now export the Watch JSON from the Artifacts panel.`;
+      `S5 Watch\n\nCreated a watch spec. You can export the Watch JSON from the Artifacts panel.`;
 
     return { userFacingMessage: msg, session: s };
   }
 
-  // S7 close (or default)
   s.state = "S7_CLOSE";
   const msg =
     `S7 Close\n\nSession closed.\n` +
@@ -228,7 +311,6 @@ function getOutputText(response: any): string {
   if (typeof response?.output_text === "string" && response.output_text.trim()) {
     return response.output_text.trim();
   }
-  // Fallback: attempt to extract from response.output structure
   const out = response?.output;
   if (Array.isArray(out)) {
     const chunks: string[] = [];
@@ -247,7 +329,6 @@ function getOutputText(response: any): string {
 }
 
 function extractJsonObject(text: string): string {
-  // Find the first `{` and the last `}` and parse the enclosed substring.
   const first = text.indexOf("{");
   const last = text.lastIndexOf("}");
   if (first === -1 || last === -1 || last <= first) {
@@ -255,40 +336,3 @@ function extractJsonObject(text: string): string {
   }
   return text.slice(first, last + 1);
 }
-
-function preventEcho(modelMsg: string, userMsg: string): string {
-  const a = normalize(modelMsg);
-  const b = normalize(userMsg);
-
-  // Simple containment check catches the common case (full copy/paste)
-  if (a.length > 0 && (a === b || a.includes(b) || b.includes(a))) {
-    return "S1 Capture\n\nI extracted constraints from your message. If anything is wrong, edit it; otherwise reply “confirm” to proceed to boundary confirmation (S2).";
-  }
-
-  // Jaccard similarity on word sets (cheap and good enough)
-  const sim = jaccardWords(a, b);
-  if (sim > 0.85) {
-    return "S1 Capture\n\nI extracted constraints from your message. If anything is wrong, edit it; otherwise reply “confirm” to proceed to boundary confirmation (S2).";
-  }
-
-  return modelMsg;
-}
-
-function normalize(s: string) {
-  return s
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[^a-z0-9 $.-]/g, "")
-    .trim();
-}
-
-function jaccardWords(a: string, b: string) {
-  const A = new Set(a.split(" ").filter(Boolean));
-  const B = new Set(b.split(" ").filter(Boolean));
-  if (A.size === 0 || B.size === 0) return 0;
-  let inter = 0;
-  for (const w of A) if (B.has(w)) inter++;
-  return inter / (A.size + B.size - inter);
-}
-
-
