@@ -14,8 +14,16 @@ export async function POST(req: NextRequest) {
     last_user_message: userMessage,
   };
 
-  // 1) Advance state deterministically (authoritative)
-  working.state = nextExecState(working);
+  // 0) Deterministic command routing (user control inputs)
+  const cmd = parseUserCommand(userMessage, session.state);
+
+  // If a command applies, override state directly.
+  if (cmd) {
+    working.state = cmd;
+  } else {
+  // 1) Otherwise advance state deterministically (authoritative)
+    working.state = nextExecState(working);
+  }
 
   // 2) Ask model for structured outputs ONLY
   const prompt = buildPrompt(working, userMessage);
@@ -42,6 +50,9 @@ export async function POST(req: NextRequest) {
     if (modelData.patch) {
       working = mergePatch(working, modelData.patch);
     }
+    if (modelData.watch) {
+      (working as any).watch = modelData.watch;
+    }
 
     // 4) Enforce caps defensively (if any candidates already exist)
     working.finalists = clampFinalists(working.finalists ?? []);
@@ -55,6 +66,9 @@ export async function POST(req: NextRequest) {
     if (working.state === "S3_EXPLORE" || working.state === "S4_DECIDE" || working.state === "S5_WATCH") {
       const stubbed = runStubStep(working, []);
       // But preserve any watch produced by the model in S5
+      if ((working as any).watch) {
+        (stubbed.session as any).watch = (working as any).watch;
+      }
       return NextResponse.json({
         userFacingMessage: userFacingMessage || stubbed.userFacingMessage,
         session: stubbed.session,
@@ -162,7 +176,8 @@ function computeMissingForS1(session: AgentSession): Array<{ key: string; questi
   }
 
   const v = session.intent.vehicle ?? {};
-  if (!v.make || !v.model || !v.gen) {
+  const hasVehicleCore = (v.model && v.gen) || (v.make && v.model);
+  if (!hasVehicleCore) {
     missing.push({ key: "vehicle", question: "Confirm make/model/generation (e.g., Porsche Boxster 986.2)." });
   }
 
@@ -335,4 +350,29 @@ function extractJsonObject(text: string): string {
     throw new Error("No JSON object found in model output");
   }
   return text.slice(first, last + 1);
+}
+
+import type { AgentState } from "@/lib/agent/schema";
+
+function parseUserCommand(userMessage: string, priorState: AgentState): AgentState | null {
+  const t = userMessage.trim().toLowerCase();
+
+  // Confirm in S2 proceeds to explore
+  if (priorState === "S2_CONFIRM" && /^confirm\b/.test(t)) return "S3_EXPLORE";
+
+  // Allow watch directly from explore
+  if (priorState === "S3_EXPLORE" && /^watch\b/.test(t)) return "S5_WATCH";
+
+  // After explore, any reply can proceed to decide (optional: require "decide")
+  if (priorState === "S3_EXPLORE" && (/^act\b/.test(t) || /^decide\b/.test(t) || /^confirm\b/.test(t))) {
+    return "S4_DECIDE";
+  }
+
+  // Explicit watch request from decide
+  if (priorState === "S4_DECIDE" && /^watch\b/.test(t)) return "S5_WATCH";
+
+  // Optional: allow revise to jump back to S1
+  if ((priorState === "S2_CONFIRM" || priorState === "S4_DECIDE") && /^revise\b/.test(t)) return "S1_CAPTURE";
+
+  return null;
 }

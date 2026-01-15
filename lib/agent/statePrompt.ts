@@ -69,6 +69,9 @@ S5_WATCH:
   - optional geography and search_strings
 - Output shape:
   { "watch": {...}, "patch": {...optional...} }
+- must_have / acceptable / reject MUST be arrays of strings (NOT objects).
+- cadence MUST be one of: "daily" | "twice_weekly" | "weekly".
+- If you have structured info, encode as strings like "mileage: ideal<50k, ok<80k".
 
 Return ONLY JSON.
 `.trim();
