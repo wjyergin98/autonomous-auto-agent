@@ -1,13 +1,19 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import type { AgentSession } from "@/lib/agent/schema";
 
-type Tab = "Session" | "Intent" | "Taste" | "Constraints" | "Finalists" | "Watch";
+export type ArtifactsTab = "Session" | "Intent" | "Taste" | "Constraints" | "Finalists" | "Watch";
 
-export default function ArtifactsPanel({ session }: { session: AgentSession }) {
-  const [tab, setTab] = useState<Tab>("Session");
-
+export default function ArtifactsPanel({
+  session,
+  tab,
+  setTab,
+}: {
+  session: AgentSession;
+  tab: ArtifactsTab;
+  setTab: (t: ArtifactsTab) => void;
+}) {
   const payload = useMemo(() => {
     switch (tab) {
       case "Session":
@@ -37,10 +43,10 @@ export default function ArtifactsPanel({ session }: { session: AgentSession }) {
     URL.revokeObjectURL(url);
   }
 
-  const tabs: Tab[] = ["Session", "Intent", "Taste", "Constraints", "Finalists", "Watch"];
+  const tabs: ArtifactsTab[] = ["Session", "Intent", "Taste", "Constraints", "Finalists", "Watch"];
 
   return (
-    <aside className="rounded-2xl border border-neutral-800 bg-neutral-900 p-4">
+    <aside className="min-w-0 rounded-2xl border border-neutral-800 bg-neutral-900 p-4">
       <div className="flex items-center justify-between gap-3">
         <div className="text-sm font-semibold">Artifacts</div>
         <button
@@ -70,7 +76,7 @@ export default function ArtifactsPanel({ session }: { session: AgentSession }) {
         ))}
       </div>
 
-      <pre className="mt-3 max-h-[70vh] overflow-auto rounded-xl border border-neutral-800 bg-neutral-950 p-3 text-xs text-neutral-200">
+      <pre className="mt-3 max-h-[70vh] min-w-0 overflow-auto whitespace-pre-wrap break-words rounded-xl border border-neutral-800 bg-neutral-950 p-3 text-xs text-neutral-200">
 {JSON.stringify(payload, null, 2)}
       </pre>
     </aside>

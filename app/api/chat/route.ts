@@ -1,34 +1,84 @@
 import { NextRequest, NextResponse } from "next/server";
-import { AgentApiRequest, AgentApiResponse, AgentSession } from "@/lib/agent/schema";
-import { nextExecState, clampDiscovery, clampFinalists } from "@/lib/agent/stateMachine";
+import { openai } from "@/lib/agent/model";
+import { ModelResponseSchema } from "@/lib/agent/modelSchema";
+import { buildPrompt } from "@/lib/agent/statePrompt";
+import { nextExecState, clampFinalists, clampDiscovery } from "@/lib/agent/stateMachine";
 import { makeCandidate } from "@/lib/agent/scoring";
+import type { AgentApiRequest, AgentApiResponse, AgentSession } from "@/lib/agent/schema";
 
 export async function POST(req: NextRequest) {
-  let payload: AgentApiRequest;
-  try {
-    payload = (await req.json()) as AgentApiRequest;
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
-  }
+  const { session, userMessage }: AgentApiRequest = await req.json();
 
-  const { session, userMessage, userImages } = payload;
-  const working: AgentSession = {
+  let working: AgentSession = {
     ...session,
     last_user_message: userMessage,
-    notes: [...(session.notes ?? []), `UserMsg: ${userMessage}`],
   };
 
+  // Advance state FIRST (state machine remains authoritative)
   const execState = nextExecState(working);
   working.state = execState;
 
-  // v1 stub behavior: generate deterministic, bounded outputs per state.
-  const response: AgentApiResponse = runStubStep(working, userImages ?? []);
+  // Build prompt
+  const prompt = buildPrompt(working, userMessage);
 
-  // Enforce caps regardless of stub/model
-  response.session.finalists = clampFinalists(response.session.finalists ?? []);
-  response.session.discovery = clampDiscovery(response.session.discovery ?? []);
+  try {
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: prompt,
+    });
 
-  return NextResponse.json(response);
+    const raw = getOutputText(response);
+    const jsonText = extractJsonObject(raw);
+    const parsed = ModelResponseSchema.safeParse(JSON.parse(jsonText));
+
+    if (!parsed.success) {
+      console.error("Raw model output:", raw);
+      console.error("Zod issues:", parsed.error.issues);
+      throw new Error("Model JSON did not match schema");
+    }
+
+    const modelData = parsed.data;
+    const userFacing =
+      modelData.user_message ??
+      modelData.message ??
+      "Received a structured update, but no user-facing message was provided.";
+    const cleaned = preventEcho(userFacing, userMessage);
+
+
+    // Merge model output into session (controlled)
+    working = {
+      ...working,
+      intent: {
+        ...working.intent,
+        ...modelData.intent,
+      },
+      constraints: {
+        tier1: modelData.constraints?.tier1 ?? working.constraints.tier1,
+        tier2: modelData.constraints?.tier2 ?? working.constraints.tier2,
+        tier3: modelData.constraints?.tier3 ?? working.constraints.tier3,
+      },
+      taste: {
+        ...working.taste,
+        rejection_rules:
+          modelData.taste?.rejection_rules ?? working.taste.rejection_rules,
+      },
+    };
+
+    // Enforce caps defensively
+    working.finalists = clampFinalists(working.finalists ?? []);
+    working.discovery = clampDiscovery(working.discovery ?? []);
+
+    const apiResponse: AgentApiResponse = {
+      userFacingMessage: cleaned,
+      session: working,
+    };
+
+    return NextResponse.json(apiResponse);
+  } catch (err) {
+    console.error("Model error, falling back:", err);
+
+    return NextResponse.json(runStubStep(working,[]));
+  }
 }
 
 function runStubStep(session: AgentSession, userImages: string[]): AgentApiResponse {
@@ -173,3 +223,72 @@ function runStubStep(session: AgentSession, userImages: string[]): AgentApiRespo
 
   return { userFacingMessage: msg, session: s };
 }
+
+function getOutputText(response: any): string {
+  if (typeof response?.output_text === "string" && response.output_text.trim()) {
+    return response.output_text.trim();
+  }
+  // Fallback: attempt to extract from response.output structure
+  const out = response?.output;
+  if (Array.isArray(out)) {
+    const chunks: string[] = [];
+    for (const item of out) {
+      const content = item?.content;
+      if (Array.isArray(content)) {
+        for (const c of content) {
+          if (c?.type === "output_text" && typeof c?.text === "string") chunks.push(c.text);
+        }
+      }
+    }
+    const joined = chunks.join("").trim();
+    if (joined) return joined;
+  }
+  throw new Error("No output text found in response");
+}
+
+function extractJsonObject(text: string): string {
+  // Find the first `{` and the last `}` and parse the enclosed substring.
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first === -1 || last === -1 || last <= first) {
+    throw new Error("No JSON object found in model output");
+  }
+  return text.slice(first, last + 1);
+}
+
+function preventEcho(modelMsg: string, userMsg: string): string {
+  const a = normalize(modelMsg);
+  const b = normalize(userMsg);
+
+  // Simple containment check catches the common case (full copy/paste)
+  if (a.length > 0 && (a === b || a.includes(b) || b.includes(a))) {
+    return "S1 Capture\n\nI extracted constraints from your message. If anything is wrong, edit it; otherwise reply “confirm” to proceed to boundary confirmation (S2).";
+  }
+
+  // Jaccard similarity on word sets (cheap and good enough)
+  const sim = jaccardWords(a, b);
+  if (sim > 0.85) {
+    return "S1 Capture\n\nI extracted constraints from your message. If anything is wrong, edit it; otherwise reply “confirm” to proceed to boundary confirmation (S2).";
+  }
+
+  return modelMsg;
+}
+
+function normalize(s: string) {
+  return s
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^a-z0-9 $.-]/g, "")
+    .trim();
+}
+
+function jaccardWords(a: string, b: string) {
+  const A = new Set(a.split(" ").filter(Boolean));
+  const B = new Set(b.split(" ").filter(Boolean));
+  if (A.size === 0 || B.size === 0) return 0;
+  let inter = 0;
+  for (const w of A) if (B.has(w)) inter++;
+  return inter / (A.size + B.size - inter);
+}
+
+

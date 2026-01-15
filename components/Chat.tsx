@@ -1,14 +1,15 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { AgentApiResponse, AgentSession, ChatMessage } from "@/lib/agent/schema";
 import StateBadge from "@/components/StateBadge";
-import ArtifactsPanel from "@/components/ArtifactsPanel";
+import ArtifactsPanel, { type ArtifactsTab } from "@/components/ArtifactsPanel";
 import ImageDropzone from "@/components/ImageDropzone";
 
-function newSession(): AgentSession {
+
+function deterministicSession(): AgentSession {
   return {
-    id: cryptoRandomId(),
+    id: "session-0",
     state: "S0_INIT",
     goal_type: "vehicle_hunt",
     intent: {
@@ -34,23 +35,44 @@ function newSession(): AgentSession {
   };
 }
 
-export default function Chat() {
-  const [session, setSession] = useState<AgentSession>(() => newSession());
-  const [messages, setMessages] = useState<ChatMessage[]>(() => [
+function deterministicMessages(): ChatMessage[] {
+  return [
     {
-      id: cryptoRandomId(),
+      id: "msg-0",
       role: "assistant",
       content:
         "Initialized v1. Paste a test case (e.g., your Boxster hunt or E92 interior swap). You can optionally upload images.",
-      timestamp: Date.now(),
+      timestamp: 0,
     },
-  ]);
+  ];
+}
+
+function newSession(): AgentSession {
+  return { ...deterministicSession(), id: cryptoRandomId() };
+}
+
+export default function Chat() {
+  const [session, setSession] = useState<AgentSession>(() => deterministicSession());
+  const [messages, setMessages] = useState<ChatMessage[]>(() => deterministicMessages());
   const [draft, setDraft] = useState("");
   const [images, setImages] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
+  const [artifactsTab, setArtifactsTab] = useState<ArtifactsTab>("Session");
+
+  // After hydration, replace deterministic placeholders with real session ids
+  useEffect(() => {
+    setSession(newSession());
+    setMessages(
+      deterministicMessages().map((m) => ({
+        ...m,
+        id: cryptoRandomId(),
+        timestamp: Date.now(),
+      }))
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const state = session.state;
-
   const transcript = useMemo(() => messages, [messages]);
 
   async function send() {
@@ -205,7 +227,7 @@ export default function Chat() {
         </div>
       </section>
 
-      <ArtifactsPanel session={session} />
+      <ArtifactsPanel session={session} tab={artifactsTab} setTab={setArtifactsTab} />
     </div>
   );
 }
