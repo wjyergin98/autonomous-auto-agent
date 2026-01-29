@@ -5,6 +5,9 @@ import { buildPrompt } from "@/lib/agent/statePrompt";
 import { nextExecState, clampFinalists, clampDiscovery } from "@/lib/agent/stateMachine";
 import { makeCandidate } from "@/lib/agent/scoring";
 import type { AgentApiRequest, AgentApiResponse, AgentSession } from "@/lib/agent/schema";
+import { normalizeSession, computeCanonicalBoundary } from "@/lib/agent/normalize";
+import { runLiveExplore } from "@/lib/market/liveExplore";
+import type { AgentState } from "@/lib/agent/schema";
 
 export async function POST(req: NextRequest) {
   const { session, userMessage }: AgentApiRequest = await req.json();
@@ -52,6 +55,44 @@ export async function POST(req: NextRequest) {
     }
     if (modelData.watch) {
       (working as any).watch = modelData.watch;
+    }
+    working = normalizeSession(working);
+
+    // ---- Live Explore short-circuit (server-owned S3) ----
+    const liveEnabled = process.env.FEATURE_LIVE_SEARCH === "true";
+
+    if (working.state === "S3_EXPLORE" && liveEnabled) {
+      try {
+        const { session: explored, meta } = await runLiveExplore(working);
+
+        const msg =
+          `S3 Explore (live)\n\n` +
+          `Fetched ${meta.used} listings (provider: Auto.dev). Showing bounded finalists/discovery.\n\n` +
+          `Finalists (≤5):\n` +
+          (explored.finalists.length
+            ? explored.finalists
+              .map((c, i) => {
+                const label = c.url ? `[${c.title}](${c.url})` : c.title;
+                return `${i + 1}. [${c.verdict}] ${label} (score ${c.score})`;
+              })
+              .join("\n")
+            : "— none met Tier 1 gates —") +
+          `\n\nDiscovery (≤3):\n` +
+          (explored.discovery.length
+            ? explored.discovery
+              .map((c, i) => {
+                const label = c.url ? `[${c.title}](${c.url})` : c.title;
+                return `${i + 1}. [${c.verdict}] ${label} (score ${c.score})`;
+              })
+              .join("\n")
+            : "— none —") +
+          `\n\nNext: Decide (buy now vs watch vs revise).`;
+
+        return NextResponse.json({ userFacingMessage: msg, session: explored } satisfies AgentApiResponse);
+      } catch (e) {
+        console.warn("Live Explore failed; falling back to placeholder:", e);
+        // fall through to normal flow (placeholder)
+      }
     }
 
     // 4) Enforce caps defensively (if any candidates already exist)
@@ -147,10 +188,15 @@ function renderMessage(session: AgentSession, modelData: any): string {
   if (state === "S2_CONFIRM") {
     const b = modelData?.boundary;
 
-    const tier1 = (b?.tier1?.length ? b.tier1 : session.constraints.tier1) ?? [];
-    const tier2 = (b?.tier2?.length ? b.tier2 : session.constraints.tier2) ?? [];
-    const rejects = (b?.hard_rejections?.length ? b.hard_rejections : session.taste.rejection_rules) ?? [];
-    const compromises = b?.acceptable_compromises ?? [];
+    const canonical = computeCanonicalBoundary(session);
+
+    const tier1 = canonical.tier1;
+    const tier2 = canonical.tier2;
+    const rejects = canonical.hard_rejections;
+
+    // Keep model’s acceptable_compromises if it provided any, but treat as advisory only.
+    const compromises =
+      (Array.isArray(b?.acceptable_compromises) ? b.acceptable_compromises : []) ?? [];
 
     return (
       "S2 Confirm\n\n" +
@@ -344,15 +390,36 @@ function getOutputText(response: any): string {
 }
 
 function extractJsonObject(text: string): string {
-  const first = text.indexOf("{");
-  const last = text.lastIndexOf("}");
-  if (first === -1 || last === -1 || last <= first) {
-    throw new Error("No JSON object found in model output");
-  }
-  return text.slice(first, last + 1);
-}
+  const start = text.indexOf("{");
+  if (start === -1) throw new Error("No JSON object found in model output");
 
-import type { AgentState } from "@/lib/agent/schema";
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+
+    if (inString) {
+      if (escape) escape = false;
+      else if (ch === "\\") escape = true;
+      else if (ch === '"') inString = false;
+      continue;
+    } else {
+      if (ch === '"') {
+        inString = true;
+        continue;
+      }
+      if (ch === "{") depth++;
+      if (ch === "}") depth--;
+      if (depth === 0) {
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+
+  throw new Error("Unterminated JSON object in model output");
+}
 
 function parseUserCommand(userMessage: string, priorState: AgentState): AgentState | null {
   const t = userMessage.trim().toLowerCase();

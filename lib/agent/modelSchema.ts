@@ -31,21 +31,51 @@ const normalizeCadence = (val: unknown): "daily" | "twice_weekly" | "weekly" | u
   return undefined;
 };
 
+const normalizeVehiclePatch = (val: unknown) => {
+  if (!val || typeof val !== "object") return val;
+  const v = { ...(val as Record<string, unknown>) };
+
+  // Alias keys the model sometimes emits
+  if (v.gen == null && typeof v.generation === "string") v.gen = v.generation;
+  if (v.color == null && typeof v.exterior_color === "string") v.color = v.exterior_color;
+
+  // Coerce year_range to string if array provided
+  if (Array.isArray(v.year_range) && v.year_range.length === 2) {
+    const a = Number(v.year_range[0]);
+    const b = Number(v.year_range[1]);
+    if (Number.isFinite(a) && Number.isFinite(b)) {
+      v.year_range = `${a}-${b}`;
+    }
+  }
+
+  return v;
+};
+
 export const PatchSchema = z
   .object({
     intent: z
       .object({
         vehicle: z
-          .object({
-            make: z.string().optional(),
-            model: z.string().optional(),
-            gen: z.string().optional(),
-            trim: z.string().optional(),
-            year_range: z.string().optional(),
-            transmission: z.string().optional(),
-            color: z.string().optional(),
-          })
-          .optional(),
+            .preprocess(
+                normalizeVehiclePatch,
+                z.object({
+                make: z.string().optional(),
+                model: z.string().optional(),
+                gen: z.string().optional(),
+                trim: z.string().optional(),
+                year_range: z.union([
+                    z.string(),
+                    z.tuple([z.number(), z.number()]).transform(([a, b]) => `${a}-${b}`),
+                    z.object({ min: z.number(), max: z.number() }).transform(({ min, max }) => `${min}-${max}`),
+                ]).optional(),
+                transmission: z.string().optional(),
+                color: z.string().optional(),
+
+                // Optional: allow engine without losing it (won’t break anything)
+                engine: z.string().optional(),
+                })
+            )
+            .optional(),
         budget: z
           .object({
             max: z.number().optional(),

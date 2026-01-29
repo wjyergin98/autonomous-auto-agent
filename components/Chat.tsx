@@ -1,10 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { AgentApiResponse, AgentSession, ChatMessage } from "@/lib/agent/schema";
 import StateBadge from "@/components/StateBadge";
 import ArtifactsPanel, { type ArtifactsTab } from "@/components/ArtifactsPanel";
 import ImageDropzone from "@/components/ImageDropzone";
+
 
 
 function deterministicSession(): AgentSession {
@@ -58,6 +61,8 @@ export default function Chat() {
   const [images, setImages] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [artifactsTab, setArtifactsTab] = useState<ArtifactsTab>("Session");
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const endRef = useRef<HTMLDivElement | null>(null);
 
   // After hydration, replace deterministic placeholders with real session ids
   useEffect(() => {
@@ -71,6 +76,11 @@ export default function Chat() {
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    // Scroll after new message is added (user or assistant)
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages.length]);
 
   const state = session.state;
   const transcript = useMemo(() => messages, [messages]);
@@ -169,7 +179,7 @@ export default function Chat() {
           </button>
         </div>
 
-        <div className="max-h-[60vh] overflow-auto p-4">
+        <div ref={scrollRef} className="max-h-[60vh] overflow-auto p-4">
           <div className="space-y-4">
             {transcript.map((m) => (
               <div
@@ -184,7 +194,42 @@ export default function Chat() {
                 <div className="mb-1 text-xs text-neutral-400">
                   {m.role === "user" ? "You" : "Agent"}
                 </div>
-                <div className="whitespace-pre-wrap text-sm text-neutral-100">{m.content}</div>
+
+                <div className="text-sm text-neutral-100">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      a: ({ ...props }) => (
+                        <a
+                          {...props}
+                          className="underline underline-offset-2 hover:opacity-80"
+                          target="_blank"
+                          rel="noreferrer"
+                        />
+                      ),
+                      code: ({ className, children, ...props }) => {
+                        const isBlock = typeof className === "string" && className.length > 0;
+                        return isBlock ? (
+                          <pre className="mt-2 overflow-auto rounded-lg border border-neutral-800 bg-neutral-950 p-3">
+                            <code className={className} {...props}>
+                              {children}
+                            </code>
+                          </pre>
+                        ) : (
+                          <code className="rounded bg-neutral-800 px-1 py-0.5" {...props}>
+                            {children}
+                          </code>
+                        );
+                      },
+                      ul: ({ ...props }) => <ul className="ml-5 list-disc space-y-1" {...props} />,
+                      ol: ({ ...props }) => <ol className="ml-5 list-decimal space-y-1" {...props} />,
+                      p: ({ ...props }) => <p className="whitespace-pre-wrap" {...props} />,
+                    }}
+                  >
+                    {m.content}
+                  </ReactMarkdown>
+                </div>
+
                 {m.images?.length ? (
                   <div className="mt-3 grid grid-cols-3 gap-2">
                     {m.images.map((src, idx) => (
@@ -198,7 +243,10 @@ export default function Chat() {
               </div>
             ))}
           </div>
+
+          <div ref={endRef} />
         </div>
+
 
         <div className="space-y-3 border-t border-neutral-800 p-4">
           <ImageDropzone images={images} setImages={setImages} />
