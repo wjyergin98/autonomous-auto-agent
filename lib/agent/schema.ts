@@ -99,6 +99,21 @@ export type AgentSession = {
   watch?: WatchSpec;
   last_user_message?: string;
   notes?: string[];
+  // ---- S4 Decide artifact ----
+  decision?: {
+    action: "ACT" | "WATCH" | "REVISE";
+    rationale: string[];
+
+    // ACT
+    selected?: Candidate;
+
+    // REVISE
+    suggestedEdits?: string[];
+
+    // WATCH (optional, future-proof)
+    blockers?: string[];
+    watchSeedSummary?: string[];
+  };
 };
 
 export type ChatMessage = {

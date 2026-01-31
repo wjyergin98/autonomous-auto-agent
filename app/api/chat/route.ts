@@ -8,6 +8,8 @@ import type { AgentApiRequest, AgentApiResponse, AgentSession } from "@/lib/agen
 import { normalizeSession, computeCanonicalBoundary } from "@/lib/agent/normalize";
 import { runLiveExplore } from "@/lib/market/liveExplore";
 import type { AgentState } from "@/lib/agent/schema";
+import { decide } from "@/lib/market/decide";
+const featureFlags = { liveExplore: true };
 
 export async function POST(req: NextRequest) {
   const { session, userMessage }: AgentApiRequest = await req.json();
@@ -58,42 +60,44 @@ export async function POST(req: NextRequest) {
     }
     working = normalizeSession(working);
 
-    // ---- Live Explore short-circuit (server-owned S3) ----
-    const liveEnabled = process.env.FEATURE_LIVE_SEARCH === "true";
+    // ---- Live Explore (S3) ----
+    if (working.state === "S3_EXPLORE" && featureFlags.liveExplore) {
+      let explored: AgentSession = working;
+      let meta: { fetched: number; used: number } | null = null;
 
-    if (working.state === "S3_EXPLORE" && liveEnabled) {
       try {
-        const { session: explored, meta } = await runLiveExplore(working);
-
-        const msg =
-          `S3 Explore (live)\n\n` +
-          `Fetched ${meta.used} listings (provider: Auto.dev). Showing bounded finalists/discovery.\n\n` +
-          `Finalists (≤5):\n` +
-          (explored.finalists.length
-            ? explored.finalists
-              .map((c, i) => {
-                const label = c.url ? `[${c.title}](${c.url})` : c.title;
-                return `${i + 1}. [${c.verdict}] ${label} (score ${c.score})`;
-              })
-              .join("\n")
-            : "— none met Tier 1 gates —") +
-          `\n\nDiscovery (≤3):\n` +
-          (explored.discovery.length
-            ? explored.discovery
-              .map((c, i) => {
-                const label = c.url ? `[${c.title}](${c.url})` : c.title;
-                return `${i + 1}. [${c.verdict}] ${label} (score ${c.score})`;
-              })
-              .join("\n")
-            : "— none —") +
-          `\n\nNext: Decide (buy now vs watch vs revise).`;
-
-        return NextResponse.json({ userFacingMessage: msg, session: explored } satisfies AgentApiResponse);
+        const exploreResult = await runLiveExplore(working);
+        explored = { ...working, ...exploreResult.session };
+        meta = exploreResult.meta;
       } catch (e) {
-        console.warn("Live Explore failed; falling back to placeholder:", e);
-        // fall through to normal flow (placeholder)
+        console.error("Live Explore failed; falling back to placeholder:", e);
       }
+
+      explored.state = "S4_DECIDE";
+
+      // ---- S3 Explore message ----
+      const exploreMsg =
+        `S3 Explore (live)\n\n` +
+        `Fetched ${meta?.used ?? "?"} listings (provider: Auto.dev). Showing bounded finalists/discovery.\n\n` +
+        `Finalists (≤5):\n` +
+        (explored.finalists?.length
+          ? explored.finalists.map((c, i) => `${i + 1}. [${c.verdict}] ${c.title} (score ${c.score})`).join("\n")
+          : "— none met Tier 1 gates —") +
+        `\n\nDiscovery (≤3):\n` +
+        (explored.discovery?.length
+          ? explored.discovery.map((c, i) => `${i + 1}. [${c.verdict}] ${c.title} (score ${c.score})`).join("\n")
+          : "— none —");
+
+      // ---- S4 Decide ----
+      const { decision, message: decideMsg } = decide(explored);
+      explored.decision = decision;
+
+      return NextResponse.json({
+        userFacingMessage: `${exploreMsg}\n\n${decideMsg}`,
+        session: explored,
+      });
     }
+
 
     // 4) Enforce caps defensively (if any candidates already exist)
     working.finalists = clampFinalists(working.finalists ?? []);
