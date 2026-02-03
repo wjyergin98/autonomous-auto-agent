@@ -9,6 +9,7 @@ import { normalizeSession, computeCanonicalBoundary } from "@/lib/agent/normaliz
 import { runLiveExplore } from "@/lib/market/liveExplore";
 import type { AgentState } from "@/lib/agent/schema";
 import { decide } from "@/lib/market/decide";
+import { ensureWatch } from "@/lib/market/watch";
 const featureFlags = { liveExplore: true };
 
 export async function POST(req: NextRequest) {
@@ -60,6 +61,30 @@ export async function POST(req: NextRequest) {
     }
     working = normalizeSession(working);
 
+    // ---- S5 Watch (explicit user intent) ----
+    if (
+      (working.state === "S4_DECIDE" || working.state === "S5_WATCH") &&
+      typeof userMessage === "string" &&
+      userMessage.toLowerCase().includes("watch")
+    ) {
+      const { watch, created } = ensureWatch(working);
+
+      working.watch = watch;
+      working.state = "S5_WATCH";
+
+      const msg =
+        `S5 Watch\n\n` +
+        (created
+          ? `This search is now being monitored.\n`
+          : `This search was already being monitored.\n`) +
+        `\nI’ll notify you when a listing appears that meets all Tier 1 constraints.`;
+
+      return NextResponse.json({
+        userFacingMessage: msg,
+        session: working,
+      });
+    }
+
     // ---- Live Explore (S3) ----
     if (working.state === "S3_EXPLORE" && featureFlags.liveExplore) {
       let explored: AgentSession = working;
@@ -81,11 +106,21 @@ export async function POST(req: NextRequest) {
         `Fetched ${meta?.used ?? "?"} listings (provider: Auto.dev). Showing bounded finalists/discovery.\n\n` +
         `Finalists (≤5):\n` +
         (explored.finalists?.length
-          ? explored.finalists.map((c, i) => `${i + 1}. [${c.verdict}] ${c.title} (score ${c.score})`).join("\n")
+          ? explored.finalists
+            .map((c, i) => {
+              const title = c.url ? `[${c.title}](${c.url})` : c.title;
+              return `${i + 1}. [${c.verdict}] ${title} (score ${c.score})`;
+            })
+            .join("\n")
           : "— none met Tier 1 gates —") +
         `\n\nDiscovery (≤3):\n` +
         (explored.discovery?.length
-          ? explored.discovery.map((c, i) => `${i + 1}. [${c.verdict}] ${c.title} (score ${c.score})`).join("\n")
+          ? explored.discovery
+            .map((c, i) => {
+              const title = c.url ? `[${c.title}](${c.url})` : c.title;
+              return `${i + 1}. [${c.verdict}] ${title} (score ${c.score})`;
+            })
+            .join("\n")
           : "— none —");
 
       // ---- S4 Decide ----
@@ -98,7 +133,6 @@ export async function POST(req: NextRequest) {
       });
     }
 
-
     // 4) Enforce caps defensively (if any candidates already exist)
     working.finalists = clampFinalists(working.finalists ?? []);
     working.discovery = clampDiscovery(working.discovery ?? []);
@@ -108,17 +142,17 @@ export async function POST(req: NextRequest) {
 
     // 6) For states not yet model-driven in v1, keep stub outputs
     // (S3/S4/S5 can be handled by model later; currently S3/S4 are placeholders)
-    if (working.state === "S3_EXPLORE" || working.state === "S4_DECIDE" || working.state === "S5_WATCH") {
-      const stubbed = runStubStep(working, []);
-      // But preserve any watch produced by the model in S5
-      if ((working as any).watch) {
-        (stubbed.session as any).watch = (working as any).watch;
-      }
-      return NextResponse.json({
-        userFacingMessage: userFacingMessage || stubbed.userFacingMessage,
-        session: stubbed.session,
-      } satisfies AgentApiResponse);
-    }
+    //if (working.state === "S3_EXPLORE" || working.state === "S4_DECIDE" || working.state === "S5_WATCH") {
+    //  const stubbed = runStubStep(working, []);
+    //  // But preserve any watch produced by the model in S5
+    //  if ((working as any).watch) {
+    //    (stubbed.session as any).watch = (working as any).watch;
+    //  }
+    //  return NextResponse.json({
+    //    userFacingMessage: userFacingMessage || stubbed.userFacingMessage,
+    //    session: stubbed.session,
+    //  } satisfies AgentApiResponse);
+    //}
 
     return NextResponse.json({
       userFacingMessage,

@@ -12,8 +12,8 @@ export type S4Decision =
   | {
       action: "WATCH";
       rationale: string[];
-      watchSeedSummary: string[]; // human-readable Tier 1 summary
-      blockers: string[];         // human-readable blockers (from candidate rationales)
+      blockers: string[];
+      watchSeedSummary: string[];
     }
   | {
       action: "REVISE";
@@ -26,14 +26,8 @@ function topByScore(arr: Candidate[]): Candidate | undefined {
   return [...arr].sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0];
 }
 
-function fmtCandidateLine(c: Candidate): string {
-  const title = c.url ? `[${c.title}](${c.url})` : c.title;
-  return `- [${c.verdict}] ${title} (score ${c.score})`;
-}
-
 /**
- * Pull a compact set of “blocking” statements from candidate rationales.
- * v1 heuristic: include any rationale line containing "not confirmed".
+ * v1 heuristic: surface unique “not confirmed” signals
  */
 function extractBlockers(candidates: Candidate[], max = 4): string[] {
   const out: string[] = [];
@@ -45,7 +39,6 @@ function extractBlockers(candidates: Candidate[], max = 4): string[] {
       const s = String(r || "").trim();
       if (!s) continue;
 
-      // keep it simple & generic (no domain literals)
       if (s.toLowerCase().includes("not confirmed")) {
         const key = s.toLowerCase();
         if (!seen.has(key)) {
@@ -59,6 +52,20 @@ function extractBlockers(candidates: Candidate[], max = 4): string[] {
   return out;
 }
 
+/**
+ * Light presentation cleanup only (no semantic changes)
+ */
+function prettyBoundary(lines: string[]) {
+  return lines.map((l) =>
+    "- " +
+    l
+      .replace(/:/g, ": ")
+      .replace(/\bonly\b/gi, "")
+      .replace(/\s+/g, " ")
+      .trim()
+  );
+}
+
 export function decide(session: AgentSession): { decision: S4Decision; message: string } {
   const finalists = session.finalists ?? [];
   const discovery = session.discovery ?? [];
@@ -66,7 +73,7 @@ export function decide(session: AgentSession): { decision: S4Decision; message: 
   const canonical = computeCanonicalBoundary(session);
   const tier1 = canonical.tier1 ?? [];
 
-  // --- ACT: at least one Tier-1 match exists ---
+  // ---- ACT ----
   if (finalists.length > 0) {
     const best = topByScore(finalists)!;
 
@@ -74,74 +81,66 @@ export function decide(session: AgentSession): { decision: S4Decision; message: 
       action: "ACT",
       selected: best,
       rationale: [
-        "At least one listing meets all Tier 1 constraints.",
-        "This is the best-scoring qualifying candidate right now.",
+        "At least one listing meets all Tier 1 constraints",
+        "This is the strongest qualifying option available now",
       ],
     };
 
     const msg =
-      `S4 Decide\n\n` +
-      `Recommendation: ACT\n\n` +
+      `S4 Decide — **Recommendation: ACT**\n\n` +
       `Why:\n` +
       decision.rationale.map((x) => `- ${x}`).join("\n") +
-      `\n\nSelected:\n` +
-      fmtCandidateLine(best) +
-      `\n\nNext: Inspect details, verify history/service, and move to outreach/PPI.`; // keep short v1
+      `\n\nNext: Inspect details, verify history/service, and proceed to outreach or PPI.`;
 
     return { decision, message: msg };
   }
 
-  // --- WATCH: no finalists, but near-misses exist ---
+  // ---- WATCH ----
   if (finalists.length === 0 && discovery.length > 0) {
     const blockers = extractBlockers(discovery);
 
     const decision: S4Decision = {
       action: "WATCH",
       rationale: [
-        "No listings currently meet all Tier 1 constraints.",
-        "Near-miss listings exist, but they fail strict requirements or lack confirmation.",
-        "Waiting is the correct decision for this specification; set a watch.",
+        "No listings meet all Tier 1 constraints",
+        "Near-misses exist but fail confirmation",
+        "Waiting preserves spec integrity",
       ],
-      watchSeedSummary: tier1,
       blockers,
+      watchSeedSummary: tier1,
     };
 
-    const top3 = discovery.slice(0, 3);
-
     const msg =
-      `S4 Decide\n\n` +
-      `Recommendation: WATCH\n\n` +
+      `S4 Decide — **Recommendation: WATCH**\n\n` +
       `Why:\n` +
       decision.rationale.map((x) => `- ${x}`).join("\n") +
       `\n\nTier 1 boundary:\n` +
-      (tier1.length ? tier1.map((x) => `- ${x}`).join("\n") : "- (none captured)") +
-      `\n\nBlocking signals (from listings):\n` +
+      (tier1.length ? prettyBoundary(tier1).join("\n") : "- (none captured)") +
+      `\n\nWhat’s missing right now:\n` +
       (blockers.length ? blockers.map((x) => `- ${x}`).join("\n") : "- (no explicit blockers captured)") +
-      `\n\nClosest matches (Discovery):\n` +
-      top3.map(fmtCandidateLine).join("\n") +
-      `\n\nNext: Create a watch (S5) or revise constraints if you want more supply.`;
+      `\n\nClosest matches are shown above in Explore.\n\n` +
+      `Next: Create a watch (S5) or revise constraints if you want more supply.`;
 
     return { decision, message: msg };
   }
 
-  // --- REVISE: nothing even close ---
+  // ---- REVISE ----
   const decision: S4Decision = {
     action: "REVISE",
     rationale: [
-      "No listings meet Tier 1 constraints and no near-misses were found in the current retrieval window.",
-      "This specification may be unrealistically strict, or the market is temporarily empty.",
+      "No listings meet Tier 1 constraints and no near-misses were found",
+      "The specification may be unrealistically strict or the market is temporarily empty",
     ],
     suggestedEdits: [
-      "Relax one Tier 1 constraint (e.g., color, trim, transmission) if acceptable.",
-      "Increase budget ceiling.",
-      "Broaden acceptable years or mileage.",
-      "Expand search radius / allow shipping if not already.",
+      "Relax one Tier 1 constraint",
+      "Increase budget ceiling",
+      "Broaden acceptable years or mileage",
+      "Expand search radius or allow shipping",
     ],
   };
 
   const msg =
-    `S4 Decide\n\n` +
-    `Recommendation: REVISE\n\n` +
+    `S4 Decide — **Recommendation: REVISE**\n\n` +
     `Why:\n` +
     decision.rationale.map((x) => `- ${x}`).join("\n") +
     `\n\nSuggested edits:\n` +
